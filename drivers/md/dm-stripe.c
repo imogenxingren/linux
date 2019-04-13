@@ -18,29 +18,31 @@
 #define DM_MSG_PREFIX "striped"
 #define DM_IO_ERROR_THRESHOLD 15
 
+/*
+ 条带映射target类型对应target device的结构
+ 描述mapped_device 到它某个 target device 的映射关系
+ 以便 IO 请求映射时的查找操作
+*/
 struct stripe {
-	struct dm_dev *dev;
-	sector_t physical_start;
-
+	struct dm_dev *dev;//对应物理设备的dm_dev结构指针
+	sector_t physical_start;//物理设备中以扇区为单位的起始位置
 	atomic_t error_count;
 };
-
+//typedef的结构
 struct stripe_c {
 	uint32_t stripes;
+	//条带序号
 	int stripes_shift;
-
-	/* The size of this target / num. stripes */
+	/* 条带对应的扇区大小*/
 	sector_t stripe_width;
-
+	//块大小
 	uint32_t chunk_size;
 	int chunk_size_shift;
-
-	/* Needed for handling events */
+	/* 需要处理的事件 */
 	struct dm_target *ti;
-
-	/* Work struct used for triggering events*/
+	/* 用于触发事件的工作结构*/
 	struct work_struct trigger_event;
-
+	//以映射结构为单元的条带数组
 	struct stripe stripe[0];
 };
 
@@ -200,7 +202,6 @@ static int stripe_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	return 0;
 }
-
 static void stripe_dtr(struct dm_target *ti)
 {
 	unsigned int i;
@@ -212,104 +213,122 @@ static void stripe_dtr(struct dm_target *ti)
 	flush_work(&sc->trigger_event);
 	kfree(sc);
 }
-
+//计算条带序号，计算bio对应的物理设备中的块序号
 static void stripe_map_sector(struct stripe_c *sc, sector_t sector,
-			      uint32_t *stripe, sector_t *result)
-{
+			      uint32_t *stripe, sector_t *result){
+	//块对应的扇区为待处理事件对应的偏移量（扇区为单位）
 	sector_t chunk = dm_target_offset(sc->ti, sector);
 	sector_t chunk_offset;
-
+	//如果条带的块大小的变化<0
 	if (sc->chunk_size_shift < 0)
+		//块偏移为待扇区对应的块大小
 		chunk_offset = sector_div(chunk, sc->chunk_size);
 	else {
+		//否则，有变化，块偏移量为chunk数量&对应的块大小-1
 		chunk_offset = chunk & (sc->chunk_size - 1);
+		//chunk号右移为对应块号的变化量
 		chunk >>= sc->chunk_size_shift;
 	}
-
+	//如果条带的变化<0	
 	if (sc->stripes_shift < 0)
+		//条带号为扇区设备中条带序号
 		*stripe = sector_div(chunk, sc->stripes);
 	else {
+		//否则条带号为块序号模去（条带数量-1）
 		*stripe = chunk & (sc->stripes - 1);
+		//块号右移为条带的偏移量
 		chunk >>= sc->stripes_shift;
 	}
-
+	//计算完条带后，再次检查块大小变化
 	if (sc->chunk_size_shift < 0)
 		chunk *= sc->chunk_size;
 	else
 		chunk <<= sc->chunk_size_shift;
-
-	*result = chunk + chunk_offset;
+	*result = chunk + chunk_offset;	//结果为块号+块位移
 }
-
+//条带映射到扇区的范围
 static void stripe_map_range_sector(struct stripe_c *sc, sector_t sector,
 				    uint32_t target_stripe, sector_t *result)
 {
 	uint32_t stripe;
-
+	//计算条带对应的块号
 	stripe_map_sector(sc, sector, &stripe, result);
 	if (stripe == target_stripe)
 		return;
-
 	/* round down */
 	sector = *result;
 	if (sc->chunk_size_shift < 0)
+		//结果为条带中块数量
 		*result -= sector_div(sector, sc->chunk_size);
 	else
 		*result = sector & ~(sector_t)(sc->chunk_size - 1);
-
+	//如果目标条带比当前对应的条带序号小，则结果+一条条带对应块数
 	if (target_stripe < stripe)
 		*result += sc->chunk_size;		/* next chunk */
 }
 
+//条带映射的范围计算，bio迭代器大小计算
 static int stripe_map_range(struct stripe_c *sc, struct bio *bio,
 			    uint32_t target_stripe)
 {
 	sector_t begin, end;
-
+	//赋值bio请求对应的迭代器的扇区号映射到物理设备上对应的扇区号
 	stripe_map_range_sector(sc, bio->bi_iter.bi_sector,
 				target_stripe, &begin);
+	//赋值bio请求对应的结束扇区号映射到物理设备上对应的扇区号
 	stripe_map_range_sector(sc, bio_end_sector(bio),
 				target_stripe, &end);
+	//如果起始扇区号小于结束扇区号
 	if (begin < end) {
+		//修改设备号为当前物理设备的设备号
 		bio_set_dev(bio, sc->stripe[target_stripe].dev->bdev);
+		//bio迭代器起始扇区号为对应起始扇区号+条带的物理起始位置
 		bio->bi_iter.bi_sector = begin +
 			sc->stripe[target_stripe].physical_start;
+		//修改迭代器的bi大小
 		bio->bi_iter.bi_size = to_bytes(end - begin);
 		return DM_MAPIO_REMAPPED;
 	} else {
+		//当前映射范围不匹配目标设备的条带
 		/* The range doesn't map to the target stripe */
 		bio_endio(bio);
+		//返回告诉DM不要再处理了
 		return DM_MAPIO_SUBMITTED;
 	}
 }
-
-static int stripe_map(struct dm_target *ti, struct bio *bio)
-{
+//bio（块设备的io请求）映射到最终存储它的设备上的相应位置
+static int stripe_map(struct dm_target *ti, struct bio *bio){
 	struct stripe_c *sc = ti->private;
 	uint32_t stripe;
 	unsigned target_bio_nr;
-
+	//bi_opf域上的标志查看,判断bio是否是REQ_PREFLUSH，进行特殊处理
 	if (bio->bi_opf & REQ_PREFLUSH) {
 		target_bio_nr = dm_bio_get_target_bio_nr(bio);
 		BUG_ON(target_bio_nr >= sc->stripes);
+		//修改bio请求对应的设备指针为对应的物理设备指针
 		bio_set_dev(bio, sc->stripe[target_bio_nr].dev->bdev);
+		//如果map函数修改了bio的内容，希望DM将bio按照新内容再分发，那么就返回DM_MAPIO_REMAPPED
 		return DM_MAPIO_REMAPPED;
-	}
-	if (unlikely(bio_op(bio) == REQ_OP_DISCARD) ||
+	}	
+	if (unlikely(bio_op(bio) == REQ_OP_DISCARD) ||//告诉块设备放弃使用某指定的块
+	    ////Secure Erase 仅会删除映象表而不会擦除所有已经被写入的块
 	    unlikely(bio_op(bio) == REQ_OP_SECURE_ERASE) ||
+	    //对指定的1个或者多个扇区写0 
 	    unlikely(bio_op(bio) == REQ_OP_WRITE_ZEROES) ||
+	    //将1个或者多个扇区写成相同的数据
 	    unlikely(bio_op(bio) == REQ_OP_WRITE_SAME)) {
+		//unlikely情况不经常发生
 		target_bio_nr = dm_bio_get_target_bio_nr(bio);
 		BUG_ON(target_bio_nr >= sc->stripes);
+		//调用map_range函数
 		return stripe_map_range(sc, bio, target_bio_nr);
 	}
-
 	stripe_map_sector(sc, bio->bi_iter.bi_sector,
 			  &stripe, &bio->bi_iter.bi_sector);
-
+	//直接修改bio的bi_sector和bi_bdev
 	bio->bi_iter.bi_sector += sc->stripe[stripe].physical_start;
 	bio_set_dev(bio, sc->stripe[stripe].dev->bdev);
-
+	//如果map函数修改了bio的内容，希望DM将bio按照新内容再分发，那么就返回DM_MAPIO_REMAPPED
 	return DM_MAPIO_REMAPPED;
 }
 
