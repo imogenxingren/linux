@@ -16,11 +16,13 @@
 #define DM_MSG_PREFIX "linear"
 
 /*
- * Linear: maps a linear range of a device.
+ 线性映射target类型对应target device的结构
+ 描述mapped_device 到它某个 target device 的映射关系
+ 以便 IO 请求映射时的查找操作
  */
 struct linear_c {
-	struct dm_dev *dev;
-	sector_t start;
+	struct dm_dev *dev;//对应物理设备的dm_dev结构指针
+	sector_t start;//在该物理设备中以扇区为单位的偏移地址
 };
 
 /*
@@ -78,27 +80,31 @@ static void linear_dtr(struct dm_target *ti)
 	kfree(lc);
 }
 
+//改变IO请求开始的扇区号bi_sector为inear target device所表示物理设备的相应位置
 static sector_t linear_map_sector(struct dm_target *ti, sector_t bi_sector)
 {
 	struct linear_c *lc = ti->private;
-
+	//物理设备上的对应位置：输入IO请求与对应物理设备扇区号，计算偏移量
 	return lc->start + dm_target_offset(ti, bi_sector);
 }
 
 static void linear_map_bio(struct dm_target *ti, struct bio *bio)
 {
-	struct linear_c *lc = ti->private;
-
+	struct linear_c *lc = ti->private;	
+	//修改bio的bi_bdev设备指针为target device对应的设备指针
 	bio_set_dev(bio, lc->dev->bdev);
+	//检查target device的起始地址是否为0，该bio请求在mapped device设备上的偏移值是否为要求的
 	if (bio_sectors(bio) || bio_op(bio) == REQ_OP_ZONE_RESET)
+		//改变IO请求开始的扇区号bi_sector为inear target device所表示物理设备的相应位置
 		bio->bi_iter.bi_sector =
 			linear_map_sector(ti, bio->bi_iter.bi_sector);
 }
 
+//将发送给逻辑设备mapped device的bio请求，根据映射关系以线性的方式重新定向到linear target device所表示物理设备的相应位置
 static int linear_map(struct dm_target *ti, struct bio *bio)
 {
 	linear_map_bio(ti, bio);
-
+	//map函数修改了bio的内容，希望DM将bio按照新内容再分发，则返回DM_MAPIO_REMAPPED
 	return DM_MAPIO_REMAPPED;
 }
 
